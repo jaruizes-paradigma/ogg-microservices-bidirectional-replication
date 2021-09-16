@@ -256,6 +256,20 @@ alter schema ogg owner to oggadm1;
 
 <br/>
 
+### Abriendo los puertos del firewall
+
+Oracle GoldenGate Microservices debe aceptar las conexiones desde Oracle GoldenGate Postgresql y también debe aceptar conexiones desde nuestra máquina local para acceder a la consola web de administración.
+
+
+Para este ejemplo vamos a abrir un rango de puertos amplio, aunque sería posible definir en el Manager qué puertos son los elegidos para las conexiones. Ejecutamos desde el terminal de la instancia EC2 de GoldenGate Postgresql los siguientes comandos:
+
+```bash
+sudo firewall-cmd --permanent --add-port=1000-61000/tcp
+sudo firewall-cmd --reload
+```
+
+
+
 ### Instalando el producto
 
 Una vez copiados los ficheros, nos conectamos a la máquina por SSH (en la salida del script de Terraform, aparece como “oracle_ggc_public_ip”).
@@ -321,6 +335,36 @@ export LD_LIBRARY_PATH=/home/ec2-user/oracle_instant_client_19c
 
 <br/>
 
+### Configurando el acceso a base de datos
+
+Para que Oracle GoldenGate Microservices pueda acceder a la base de datos Oracle es necesario configurar la conexión. Esto se realiza mediante el fichero "*tnsnames.ora*". Para ello, creamos el fichero “tnsnames.ora” en el directorio “/home/ec2-user/tnsnames”:
+
+```bash
+vi /home/ec2-user/tnsnames/tnsnames.ora
+```
+
+E incluimos las siguientes líneas:
+
+```bash
+ORARDS =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = #ORACLE_RDS_ENDPOINT#)(PORT = 1521))
+    (CONNECT_DATA =
+      (SID = ggdemo)
+    )
+  )
+```
+
+Sustituyendo #ORACLE_RDS_ENDPOINT# por el valor correspondiente a la base de datos Oracle creada. Como se ha comentado anteriormente, el valor se puede consultar en la consola de AWS o de la salida del script de Terraform, en la clave “oracle_endpoint”
+
+Por último, hay que definir la variable de entorno TNS_ADMIN:
+
+```bash
+export TNS_ADMIN=/home/ec2-user/tnsnames
+```
+
+<br/>
+
 ### Configurando el deployment
 
 El siguiente paso es crear el deployment que vamos a utilizar. Para ello, también vamos a necesitar un fichero “.rsp”:
@@ -338,7 +382,7 @@ DEPLOYMENT_NAME=ggma
 ADMINISTRATOR_USER=oggadm
 ADMINISTRATOR_PASSWORD=oggadm
 SERVICEMANAGER_DEPLOYMENT_HOME=/home/ec2-user/ggma/deploymentHome/ServiceManager
-HOST_SERVICEMANAGER=ip-10-0-3-206.eu-west-1.compute.internal
+HOST_SERVICEMANAGER=##REEMPLAZAR POR LA IP DE LA MAQUINA##
 PORT_SERVICEMANAGER=9001
 SECURITY_ENABLED=false
 STRONG_PWD_POLICY_ENABLED=false
@@ -386,20 +430,71 @@ PMSRVR_DATASTORE_HOME=
 OGG_SCHEMA=oggadm1
 ```
 
-Guardamos y lanzamos el siguiente comando:
+Tenemos que reemplazar el valor de "HOST_SERVICEMANAGER" por el valor de la IP del EC2 que estamos usando. Guardamos y lanzamos el siguiente comando:
 
-```
+```bash
 cd /home/ec2-user/ggma/bin
 ./oggca.sh -silent -responseFile /home/ec2-user/ggma-install/oggca-install.rsp
 ```
 
+Este proceso tarda unos minutos. Ten paciencia. Cuando finalice, verás un mensaje similar a este:
+
+```bash
+[ec2-user@ip-10-0-3-144 bin]$ ./oggca.sh -silent -responseFile /home/ec2-user/ggma-install/oggca-install.rspOracle GoldenGate Service Manager for Oracle
+Version 19.1.0.0.4 OGGCORE_19.1.0.0.0_PLATFORMS_191017.1054
+
+Copyright (C) 1995, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Linux, x64, 64bit (optimized) on Oct 17 2019 14:47:09
+Operating system character set identified as UTF-8.
+
+In order to register Service Manager as a system service/daemon, as a "root" user, execute the following script:
+        (1). /home/ec2-user/ggma/deploymentHome/ServiceManager/bin/registerServiceManager.sh
+
+To execute the configuration scripts:
+  1.Open a terminal window
+  2.Login as "root"
+  3.Run the script
+
+
+Successfully Setup Software.
+```
+
+Tal y como dice, procedemos a registrar el Service Manager como daemon, ejecutando:
+
+```bash
+sudo sh /home/ec2-user/ggma/deploymentHome/ServiceManager/bin/registerServiceManager.sh
+```
+
+Y ya podemos acceder a la consola web, escribiendo en el navegador:
+
+```
+http://<IP EC2>:9001/
+```
+
+Nos aparcerá una pantalla similar a la siguiente:
+
+![login](readme/img/login.jpg)
+
+El usuario y password que hemos configurado en el fichero "oggca-install.rsp" es oggadm/oggadm
 
 
 
+### Creando el almacén de credenciales
 
+Una vez dentro, el primer paso es crear el almacén de credenciales, para poder acceder a la base de datos usando un alias. Para ello, tenemos que hacer click en "Administration Server":
 
+![login](readme/img/link_adminserver.jpg)
 
+Accederemos a una nueva consola web, la del Administration Server, en la que introduciremos de nuevo el mismo usuario y password. Una vez dentro, en el menú, seleccionamos la opción "Configuration", apareciendo una pantalla como la siguiente:
 
+![login](readme/img/admin_conf.jpg)
+
+ Pulsamos el símbolo más y nos aparece el formulario para la creación de credenciales. Los datos son los siguientes:
+
+- Credential Alias: orards
+- User ID: oggadm1@orards
+- Password: oggadm1
 
 <br/><br/>
 
