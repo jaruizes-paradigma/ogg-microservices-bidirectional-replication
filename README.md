@@ -280,6 +280,7 @@ Creamos los siguientes directorios:
 mkdir /home/ec2-user/ggma-install
 mkdir /home/ec2-user/ggma
 mkdir /home/ec2-user/oracle_instant_client_19c
+mkdir /home/ec2-user/tnsnames
 ```
 
 A continuación, procedemos a instalar el cliente de base de datos **Oracle Instant Client**. Para ello, lanzamos:
@@ -496,6 +497,16 @@ Accederemos a una nueva consola web, la del Administration Server, en la que int
 - User ID: oggadm1@orards
 - Password: oggadm1
 
+Guardamos y para comprobar que se ha configurado correctamente, pulsamos el botón marcado con el círculo:
+
+![login](readme/img/login_database.jpg)
+
+Si hemos realizado bien la credencial, veremos que se conecta y que no devuelve ningún error. Para finalizar, vamos a rellenar el formulario correspondiente a “Transaction Information”. Para ello, hacemos click en el símbolo “+”, marcamos “Table” y rellenamos los datos correspondientes a nuestra tabla:
+
+![login](readme/img/transaction_infromation.jpg)
+
+
+
 <br/><br/>
 
 ## Instalando Oracle GoldenGate Postgresql
@@ -621,3 +632,522 @@ info mgr
 ```
 
 <br/><br/>
+
+## Implementando el proceso de carga inicial
+
+
+
+### Creando el extract en GG Microservices
+
+El extract se crea desde la consola del Administration Server, que encontramos en la url "http://<IP EC2>:9010/". Accedemos a ella y pulsamos en el símbolo "+" de la sección "extracts". Se abrirá el wizard de creación. En el primer paso, elegimos "carga inicial" y pulsamos "Siguiente":
+
+![einiload_type](readme/img/einiload_type.jpg)
+
+En el siguiente apartado, rellenamos las opciones, básicamente el nombre y la credencial:
+
+![einiload_options](readme/img/einiload_options.jpg)
+
+Pulsamos siguiente y por último, pegamos las líneas correspondientes al fichero de parámetros:
+
+```bash
+extract einiload
+useridalias orards domain OracleGoldenGate
+rmthost #IP_PRIVADA_EC2_GG_POSTGRESQL#, mgrport 28710
+rmttask replicat, group riniload
+table oracledb.customers;
+```
+
+Debemos reemplazar *#IP_PRIVADA_EC2_GG_POSTGRESQL#* por el valor que tenga en la salida del script de Terraform, en la clave: “*oracle_ggc_postgresql_private_ip*”.
+
+Para finalizar, pulsamos "Create" y nos aparecerá el extract en el apartado del Administrator Server:
+
+![einiload_options](readme/img/einiload_complete.jpg)
+
+<br/>
+
+### Creando el replicat en GG Postgresql
+
+Una vez configurada la parte correspondiente al origen, es decir, GoldenGate Microservices, tenemos que configurar la parte correspondiente al destino, GG Postgresql, que se encargará de la carga inicialCreando el fichero de parámetros.
+
+Para ello, nos conectamos a la máquina EC2 de GoldenGate Postgresql y volvemos a entrar en GGSCI:
+
+```bash
+cd /home/ec2-user/gg-postgresql
+./ggsci
+```
+
+
+
+A continuación, de forma similar a como hemos hecho en el punto anterior con el extract, creamos los parámetros asociados al replicat “riniload”. Escribimos:
+
+```
+edit params riniload
+```
+
+
+
+Como contenido del fichero de parámetros, establecemos lo siguiente:
+
+```bash
+replicat riniload
+setenv ( pgclientencoding = "utf8" )
+setenv (nls_lang="american_america.al32utf8")
+targetdb pg96db, userid oggadm1, password oggadm1
+discardfile ./dirrpt/customers.dsc, purge
+map oracledb.customers, target particulares.customers, where (tipo = 1);
+map oracledb.customers, target empresas.customers, where (tipo = 2);
+```
+
+
+
+En este fichero estamos diciendo que
+
+1. está asociado al fichero de parámetros “riniload”
+2. establecemos el tipo de encoding
+3. establecemos el tipo de codificación que usa el cliente
+4. indicamos que se debe conectar a la base de datos con identificador pg96db, definida en el fichero odbc.ini
+5. configuramos el fichero de descartes a ./dirrpt/customers.dsc
+6. hacemos el mapeo de que los datos que llegan de Oracle con el valor de la columna TIPO a 1, se mandan a la tabla CUSTOMERS del esquema PARTICULARES, en Postgresql
+7. hacemos el mapeo de que los datos que llegan de Oracle con el valor de la columna TIPO a 2, se mandan a la tabla CUSTOMERS del esquema EMPRESAS, en Postgresql
+
+<br/>
+
+### Añadiendo el replicat
+
+El siguiente paso consiste en la creación del replicat asociado al fichero de parámetros. Para ello, en GGSCI, escribimos:
+
+```bash
+add replicat riniload, specialrun
+```
+
+
+Como se ha comentado anteriormente, en la carga inicial, el replicat no es un proceso que esté levantado esperando que lleguen cambios a aplicar en la base de datos, como sería en el proceso de CDC. En este caso, lo añadimos con el tipo “specialrun”, que quiere decir que será ejecutado en modo “batch” por el manager cuando lleguen los datos de la carga inicial. 
+
+<br/><br/>
+
+## Implementando el proceso de CDC de Oracle a Postgresql
+
+### Creando el extract (en GG Microservices)
+
+Nos conectamos de nuevo a la consola web del Administrator Sever de GoldenGate Microservices (http://<IP EC2>:9010/). Pulsamos en el símbolo "+" y se abre el wizard de creación, como en la carga inicial. En el primer paso, elegimos "Integrated Extract":
+
+![ecdcora_type](readme/img/ecdcora_type.jpg)
+
+Pulsamos "Siguiente" y rellenamos las opciones. Básicamente el nombre, la credencial y el SCN. Para obtener el SCN lanzamos la siguiente query a la base de datos Oracle:
+
+```sql
+SELECT current_scn FROM V$DATABASE;
+```
+
+Y rellenamos el formulario:
+
+![ecdcora_type](readme/img/ecdcora_options.jpg)
+
+Por último, rellenamos el fichero de parámetros. Tenemos que copiar lo siguiente:
+
+```
+extract ecdcora
+useridalias orards domain OracleGoldenGate
+exttrail lt
+table oracledb.customers;
+```
+
+Guardamos y nos aparecerá el nuevo extract junto al de carga inicial. Por último, tenemos que arrancarlo. Para ello, en el menú del extract, "Actions", elegimos "Start"
+
+<br/>
+
+### Creando el data pump 
+
+Una vez que hemos creado el extract primario, vamos a crear el data pump. Los data pump no se crean desde el Admin Server sino que tenemos ir al Distribution Server. Para ello, debemos ir a la URL: "http://<IP EC2>:9011/". Se abrirá una nueva consola web (mismo usuario y password).
+
+Pulsamos el símbolo "+" para acceder al wizard de creación, empezando por la parte de path, donde tenemos que rellenar los siguientes datos:
+
+![pcdcora_path](readme/img/pcdcora_path.jpg)
+
+También le decimos que empiece a procesar cambios desde este mismo momento:
+
+![pcdcora_begin](readme/img/pcdcora_begin.jpg)
+
+Y añadimos reglas para procesar la tabla:
+
+![pcdcora_begin](readme/img/pcdcora_rules.jpg)
+
+Pulsamos "Add" y "Create". Por último, en la página del formulario, pulsamos "Create Path" para crear realmente el data pump. Ahora, lo arrancamos:
+
+![pcdcora_start](readme/img/pcdcora_start.jpg)
+
+<br/>
+
+### Creando el Replicat (en GG Postgresql)
+
+Una vez que hemos configurado la parte “origen” tenemos que configurar el “Replicat” para que replique los datos en Postgresql, cada parte en su tabla correspondiente (particulares / empresas)
+
+Como siempre, lo primero es definir el fichero de parámetros, que va a ser muy similar al de la carga inicial. Para ello, lanzamos el siguiente comando desde GGSCI en la máquina EC2 de Postgresql:
+
+```
+edit params rcdcora
+```
+
+En el editor que aparece, copiamos:
+
+```
+replicat rcdcora
+assumetargetdefs
+discardfile ./dirrpt/rcdcora.dsc, purge, megabytes 100
+targetdb pg96db, userid oggadm1, password oggadm1
+map oracledb.customers, target particulares.customers, where (tipo = 1);
+map oracledb.customers, target empresas.customers, where (tipo = 2);
+```
+
+<br/>
+
+En ese fichero, estamos diciendo:
+
+1. lo vamos a asociar al replicat “rcdcora”
+2. con “assumetargetdefs” indicamos que la estructura (si no se indica nada en los mapeos) es similar en origen y destino
+3. que utilice un fichero de descartes llamado “rcdcora.dsc”
+4. establecemos los mapeos, indicando que los registros con TIPO = 1 van a la tabla “CUSTOMERS” del esquema “particulares” y los que tengan TIPO = 2 van a la tabla “CUSTOMERS” del esquema “empresas” 
+
+
+
+Ahora, vamos a añadir y configurar el replicat. Lo primero es hacer login en la base de datos:
+
+```
+dblogin sourcedb pg96db, userid oggadm1, password oggadm1
+```
+
+A continuación, establecemos el uso de una tabla (interna) de control para llevar el registro de qué se ha replicado. Para ello lanzamos:
+
+```
+add checkpointtable ogg.chkptable
+```
+
+Después, añadimos el replicat y lo asociamos a la tabla de control:
+
+```
+add replicat rcdcora, exttrail ./dirdat/rt, checkpointtable ogg.chkptable
+```
+
+Por último, arrancamos el replicat y comprobamos que arranca correctamente:
+
+```
+start rcdcora
+info rcdcora
+```
+
+<br/>
+
+### Probando el proceso de replicación unidireccional
+
+#### Ejecutando la carga inicial
+
+Para lanzar el proceso, lo tenemos que hacer desde el origen, es decir, desde GoldenGate Microservices. Para ello, nos conectamos a la consola de **Administrator Server**, y en el menú "Actions" del extract "einiload", seleccionamos "Start" :
+
+![einiload_start](readme/img/einiload_start.jpg)Cuando el proceso acabe, podemos entrar en los detalles del extract y acceder al reporte. Veremos que se han enviado 8 inserciones:
+
+![einiload_report](readme/img/einiload_report.jpg)
+
+Si vamos al destino, tendremos los datos en las tablas de los esquemas de particulares y empresas de Postgresql.
+
+<br>
+
+#### Modificando una fila
+
+Ahora vamos a modificar dos filas, una correspondiente a un particular y otra correspondiente a una empresa, para verificar que las modificaciones se propagan a Postgresql, cada una a la tabla correspondiente. Para ello lanzamos las siguientes sentencias SQL sobre la base de datos Oracle:
+
+```sql
+UPDATE CUSTOMERS SET EMAIL='emailmod@email.com' WHERE ID IN (1,6);
+COMMIT;
+```
+
+Si vamos a Postgresql veremos que el cambio de email se ha realizado para el cliente particular (esquema particulares) con ID=1 y para el cliente empresa (esquema empresas) con ID=6
+
+<br/><br/>
+
+## Implementando el proceso de CDC de Postgresql a Oracle
+
+### Configurando las secuencias 
+
+#### Oracle
+
+Lanzamos la siguiente secuencia indicando que la secuencia siempre se incremente en dos unidades:
+
+```sql
+ALTER SEQUENCE CUSTOMERS_SEQ INCREMENT BY 2;
+```
+
+<br/>
+
+#### Postgresql
+
+Desde el cliente de Postgresql, lanzamos:
+
+```sql
+SELECT setval('empresas.customers_id_seq', (SELECT (max(id) + 1) from empresas.customers));
+ALTER SEQUENCE empresas.customers_id_seq INCREMENT BY 2;
+ALTER TABLE PARTICULARES.CUSTOMERS ALTER COLUMN ID SET DEFAULT nextval('empresas.customers_id_seq');
+```
+
+Como en este punto tenemos ambas fuentes sincronizadas, lo que hacemos es decir que la secuencia de empresas continue en un valor más, que incremente en dos unidades cada vez y que la tabla de particulares también use esa misma secuencia.
+
+Es decir, si, por ejemplo, el valor más alto de los IDs actuales es par, se mantendrá par en el lado Oracle (solo hemos establecido que se incremente en dos unidades cada vez) pero impar en el lado Postgresql (hemos sumado uno al valor actual y decimos que se incremente en dos unidades cada vez).
+
+<br />
+
+### Modificando el extact "ecdcora" para evitar bucles de replicación
+
+Para ello, accedemos a la consola web de Administrator Server, paramos el extract "ecdcora" mediante la opción "Stop" del menú "actions" del propio extract y modificamos sus parámetros, incluyendo la línea "tranlogoptions excludeuser oggadm1", quedando de tal manera:
+
+![einiload_report](readme/img/ecdcora_updated.jpg)
+
+
+
+Después, arrancamos de nuevo el extract mediante la opción "Start" del menú "actions" del propio extract
+
+<br />
+
+### Implementado el proceso de replicación
+
+Se realiza de forma muy similar al proceso de Oracle a Postgresql. Es decir, necesitamos un extract y un data pump en el lado de Postgresql y un replicat en el lado de Oracle.
+
+#### Creando el extract en (GoldenGate for Postgresql)
+
+Lo primero es crear el fichero de parámetros. Para ello, nos conectamos a GGSCI de GoldenGate para Postgresql y escribimos:
+
+```
+edit params ecdcpsql
+```
+
+En el edito que se abre, escribimos:
+
+```
+extract ecdcpsql
+sourcedb pg96db, userid oggadm1, password oggadm1
+TRANLOGOPTIONS FILTERTABLE ogg.chkptable
+exttrail ./dirdat/lt
+table particulares.customers;
+table empresas.customers;
+```
+
+En este fichero estamos diciendo:
+
+1. está asociado al extract “ecdcpsql”
+2. se conecta a la base de datos usando el usuario oggadm1
+3. va a utilizar el punto de chequeo
+4. en el “trail” local va a incluir los cambios correspondientes a la tablas CUSTOMERS de los esquemas “particulares” y “empresas”
+
+<br/>
+
+Una vez hemos definido el fichero de parámetros, tenemos que crear el extract. Dentro de GGSCI, lo primero es hacer login:
+
+```
+dblogin sourcedb pg96db, userid oggadm1, password oggadm1
+```
+
+Después, registramos el extract en la base de datos:
+
+```
+register extract ecdcpsql with database PostgreSQL
+```
+
+Añadimos el extract y le decimos que “empiece” a partir del final del fichero de registro transaccional:
+
+```
+add extract ecdcpsql, tranlog, eof
+```
+
+Declaramos los ficheros “locales” de trail asociados al extract:
+
+```
+add exttrail ./dirdat/lt, extract ecdcpsql
+```
+
+Por último, podemos arrancar el extract y comprobar que se levanta correctamente:
+
+```
+start ecdcpsql
+info ecdcpsql
+```
+
+<br/>
+
+#### Creando el data pump (GoldenGate for Postgresql)
+
+Una vez que tenemos el extract, tenemos que configurar el data pump o extract secundario. Este elemento, leerá de los ficheros locales de trail y generará los ficheros remotos de trail. De forma similar a todos los elementos anteriores, lo primero que tenemos que hacer es definir los parámetros. Para ello, ejecutamos:
+
+```
+edit params pcdcpsql
+```
+
+
+
+En el editor, escribimos:
+
+```
+extract pcdcpsql
+sourcedb pg96db, userid oggadm1, password oggadm1
+RMTHOST #IP_PRIVADA_GG_CLASSIC#, MGRPORT 9012
+RMTTRAIL ./dirdat/rt
+PASSTHRU
+table particulares.customers;
+table empresas.customers;
+```
+
+Tenemos que reemplazar la cadena #IP_PRIVADA_GG_CLASSIC# por la IP correspondiente. Aparece en la salida del script de Terraform con la clave “oracle_ggc_private_ip“.
+
+En este fichero estamos diciendo:
+
+1. lo vamos a asociar al extract (Data Pump) “pcdcpsql”
+2. con passthru le decimos que no tiene que aplicar ningún fichero de definición de tablas
+3. el host remoto está en la dirección IP de la máquina EC2 de GoldenGate para Oracle. En este caso, el puerto es el del Receiver Server de GoldenGate Microservices, es decir, 9012
+4. el fichero trail remoto serán los que empiezan por “rt”
+5. nos vamos a centrar en las tablas “CUSTOMER” de los esquemas “particulares” y “empresas” 
+
+
+
+A continuación vamos a añadir el Data Pump. Primero tenemos que hacer login:
+
+```
+dblogin sourcedb pg96db, userid oggadm1, password oggadm1
+```
+
+
+
+Después, lanzamos el siguiente comando para añadir el Data Pump:
+
+```
+add extract pcdcpsql, exttrailsource ./dirdat/lt, begin now
+```
+
+
+
+Por último, añadimos el trail:
+
+```
+add rmttrail ./dirdat/rt extract pcdcpsql
+```
+
+
+
+Solo nos queda arrancar el data pump y comprobar que se levanta correctamente:
+
+```
+start pcdcpsql
+info pcdcpsql
+```
+
+<br/>
+
+#### Creando tabla de checkpoint (GoldenGate Microservices)
+
+Antes de crear el replicat vamos a crear una tabla de control. Para ello, como hicimos al crear el almacén de credenciales, accedemos a la opción “Configuración” del menú de Admin Server y, en la fila de las credenciales que hemos creado al inicio, pulsamos el botón de login:
+
+![img](readme/img/ogg_checkpoint.png) 
+
+Nos aparecen nuevos elementos en pantalla entre los que se incluye la tabla de control. Pulsamos el símbolo “+” al lado de “Checkpoint” y rellenamos el nombre de la tabla, incluyendo el esquema (vamos a usar el del usuario de GoldenGate):
+
+![img](readme/img/ogg_checkpoint_2.png)
+
+Pulsamos “Submit”.
+
+#### Creando el Replicat (GoldenGate Microservices)
+
+Volvemos a la consola del Administrator Server y en esta ocasión pulsamos el símbolo "+" del apartado "Replicats". Se abrirá el formulario correspondiente a la creación del réplicat:
+
+![img](readme/img/rcdcpsql_type.png) 
+
+Una vez seleccionado el tipo, rellenamos los datos básicos correspondientes al replicat, incluyendo la tabla de control:
+
+![img](readme/img/rcdcpsql_basic.png)
+
+ Pulsamos siguiente y solo nos queda rellenar los datos correspondientes a los parámetros:
+
+```
+replicat rcdcpsql
+useridalias orards domain OracleGoldenGate
+assumetargetdefs
+map particulares.customers, target oracledb.customers, colmap(usedefaults, tipo=1);
+map empresas.customers, target oracledb.customers, colmap(usedefaults, tipo=2);
+```
+
+
+
+Pulsamos “Create and Run” y nos aparecerá creado en la vista principal:
+
+![img](readme/img/rcdcpsql_complete.png) 
+
+Si nos vamos al “Receiver Server” veremos que se ha creado automáticamente un path correspondiente al replicat:
+
+![img](readme/img/rcdcpsql_path.png) 
+
+<br/><br/>
+
+### Probando el proceso de replicación bidireccional
+
+Para probar el proceso, vamos a repetir las mismas pruebas que hicimos en el caso de replicación bidireccional con GoldenGate Classic.
+
+#### Insertando clientes en Postgresql
+
+Vamos a insertar dos clientes nuevos en Postgresql, uno de tipo particular y otro de tipo empresa. Para ello, lanzamos sobre Postgresql el comando:
+
+```sql
+INSERT INTO empresas.customers (id, cif, razonsocial, email, telefono, descripcion, representante) VALUES (DEFAULT, '123456TBD', 'Empresa Nueva', 'empnueva@gmail.com', '91555555', 'Desc Empresa nueva', 'Juan');
+INSERT INTO particulares.customers (id, nif, nombre, email, telefono) VALUES (DEFAULT, '123456TBD', 'Particular Nuevo', 'partnuevo@gmail.com', '91123123');
+COMMIT;
+```
+
+Veremos que las nuevas filas se replican en Oracle, en la tabla customers. Además, podemos ver de forma gráfica, las estadísticas del replicat en GoldenGate Microservices:
+
+![img](readme/img/replicat_stats.jpg)
+
+<br/>
+
+#### Insertando un cliente en Oracle
+
+Ahora vamos a comprobar que la replicación en el sentido inicial, sigue funcionando y que no se produce un problema con las secuencias o un bucle de replicación. Para ello, sobre Oracle, lanzamos:
+
+```sql
+INSERT INTO CUSTOMERS (NIF, EMAIL, TELEFONO, NOMBRE, TIPO) VALUES ('987654TBD'', 'nuevodesdeoracle@gmail.com', '222222222', 'Nuevo desde Oracle', '1');
+COMMIT;
+```
+
+Vamos a Postgresql a verificar que existe una nueva fila en la tabla de particulares.
+
+<br/>
+
+#### Eliminando los datos desde Postgresql
+
+Ahora, vamos a eliminar las tres filas insertadas. Para ello lanzamos, desde Postgresql (como las secuencias serán diferentes en las diferentes ejecuciones, vamos a usar los campos NIF y CIF):
+
+```sql
+DELETE FROM empresas.customers WHERE CIF='123456TBD';
+DELETE FROM particulares.customers WHERE NIF='123456TBD';
+DELETE FROM particulares.customers WHERE NIF='987654TBD';
+COMMIT;
+```
+
+Si comprobamos la tabla de Oracle veremos que se han eliminado las filas correspondientes.
+
+
+
+<br/><br/>
+
+## Destruyendo la infraestructura
+
+Una vez terminada la prueba, para destruir la infraestructura basta con lanzar el script de destrucción, desde el contenedor Docker que creamos al inicio. Si nos hemos salido, basta con ejecutar:
+
+```bash
+docker run -it --rm -e KEY_ID=<AWS_USER_KEY_ID> -e SECRET_ID=<AWS_SECRET_KEY_ID> -v $(pwd)/iac:/root/iac --entrypoint /bin/bash ogg_infra_builder
+```
+
+reemplazando 
+
+- AWS_USER_KEY_ID: valor de la KEY del usuario de AWS
+- AWS_SECRET_KEY_ID: valor de la SECRET del usuario de AWS
+
+Después, ejecutamos dentro del contenedor el comando:
+
+```bash
+sh destroy.sh
+```
+
